@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import requests
 
 
 # ==========================
@@ -54,6 +55,43 @@ if "player_inputs" not in st.session_state:
         "Player 2"
     ]
 
+def get_event(event_ticker):
+
+    event_ticker = event_ticker.upper().strip()
+
+    url = f"https://api.elections.kalshi.com/trade-api/v2/markets?event_ticker={event_ticker}"
+    response = requests.get(url)
+
+    teams = []
+    probs = []
+
+    for market in response.json()['markets']:
+
+        team = market["yes_sub_title"].strip()
+        teams.append(team)
+
+        ask_price = float(market["previous_yes_ask_dollars"])
+        bid_price = float(market["previous_yes_bid_dollars"])
+        prob = 100 * (ask_price + bid_price) / 2 if (ask_price > 0 and bid_price > 0) else 0
+        probs.append(prob)
+
+    df = pd.DataFrame(
+        {
+            "team": teams,
+            "prob": probs
+        }
+    )
+    df["prob"] = 100 * df["prob"] / df["prob"].sum()
+
+    return df
+
+
+LEAGUES = {
+    "US Open Men": "kxatp-26uso",
+    "US Open Women": "kxwta-26uso",
+    "College Football": "kxncaaf-27",
+    "Premier League": "kxpremierleague-27",
+}
 
 # ==========================
 # SETUP
@@ -62,9 +100,6 @@ if "player_inputs" not in st.session_state:
 if st.session_state.page == "setup":
 
     st.title("Fantasy Draft Setup")
-
-    data = pd.read_csv("events.csv")
-
 
     # ---- Drafters ----
 
@@ -121,26 +156,22 @@ if st.session_state.page == "setup":
         "Select leagues available in the draft:"
     )
 
+    selected_leagues = st.multiselect(
+        "Leagues",
+        options=list(LEAGUES.keys()),
+        default=list(LEAGUES.keys()),
+        key="league_multiselect"
+    )
 
-    selected_leagues = []
-
-
-    league_cols = st.columns(4)
-
-
-    for i, league in enumerate(
-        sorted(data["league"].unique())
-    ):
-
-        with league_cols[i % 4]:
-
-            if st.checkbox(
-                league,
-                value=True,
-                key=f"league_{league}"
-            ):
-
-                selected_leagues.append(league)
+    with st.spinner("Fetching Kalshi data..."):
+        import time
+        time.sleep(2)  # Simulate a delay for fetching data
+        data = pd.DataFrame()
+        for league_name in selected_leagues:
+            league_ticker = LEAGUES[league_name]
+            league_events = get_event(league_ticker)
+            league_events["league"] = league_name
+            data = pd.concat([data, league_events], ignore_index=True)
 
 
     # ---- Start ----
@@ -148,7 +179,7 @@ if st.session_state.page == "setup":
     st.divider()
 
 
-    if st.button(
+    if data is not None and st.button(
         "Start Draft!",
         type="primary"
     ):
