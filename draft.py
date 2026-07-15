@@ -1,6 +1,5 @@
 import hashlib
 import json
-import colorsys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +42,15 @@ def normalize_pick_entry(selection, overall_pick=None, round_number=None, pick_i
     team = str(raw_pick.get("team", "")).strip()
     league = str(raw_pick.get("league", "")).strip()
 
+    def to_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return False
+
     prob_at_pick = raw_pick.get("prob_at_pick", raw_pick.get("prob", 0.0))
     try:
         prob_at_pick = float(prob_at_pick)
@@ -57,9 +65,35 @@ def normalize_pick_entry(selection, overall_pick=None, round_number=None, pick_i
         except (TypeError, ValueError):
             return None
 
+    pick_type_raw = str(raw_pick.get("pick_type", "")).strip().lower()
+    legacy_is_field = to_bool(raw_pick.get("is_field", False))
+    inferred_is_field = team.lower() == "the field"
+
+    is_field = legacy_is_field or inferred_is_field or pick_type_raw == "field"
+    pick_type = "field" if is_field else "team"
+
+    field_scope = str(raw_pick.get("field_scope", "")).strip().lower()
+    if not field_scope and is_field:
+        field_scope = "league"
+    if not is_field:
+        field_scope = ""
+
+    if is_field and not team:
+        team = "The Field"
+
+    field_value = raw_pick.get("field_value", 0.0)
+    try:
+        field_value = float(field_value)
+    except (TypeError, ValueError):
+        field_value = 0.0
+
     normalized = {
         "team": team,
         "league": league,
+        "pick_type": pick_type,
+        "is_field": is_field,
+        "field_scope": field_scope,
+        "field_value": field_value,
         "prob_at_pick": prob_at_pick,
         "round": to_int(raw_pick.get("round", raw_pick.get("round_number"))),
         "pick_in_round": to_int(raw_pick.get("pick_in_round", raw_pick.get("pick"))),
@@ -108,6 +142,182 @@ def normalize_all_drafts(drafts, drafter_order=None, include_empty=False):
     return normalized
 
 
+def get_drafted_field_leagues(drafts):
+    drafted_field_leagues = set()
+
+    for picks in (drafts or {}).values():
+        for normalized_pick in normalize_drafter_picks(picks):
+            if not normalized_pick.get("is_field"):
+                continue
+
+            league_name = str(normalized_pick.get("league", "")).strip()
+            if league_name:
+                drafted_field_leagues.add(league_name)
+
+    return drafted_field_leagues
+
+
+def _clamp_probability(value):
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        numeric_value = 0.0
+
+    return max(0.0, min(100.0, numeric_value))
+
+
+def compute_field_values_by_league(drafts):
+    league_non_field_totals = {}
+    field_leagues = set()
+    invalid_field_picks = []
+
+    normalized_drafts = normalize_all_drafts(drafts)
+    for drafter_name, normalized_picks in normalized_drafts.items():
+        for normalized_pick in normalized_picks:
+            league_name = str(normalized_pick.get("league", "")).strip()
+
+            if normalized_pick.get("is_field"):
+                if not league_name:
+                    invalid_field_picks.append(
+                        {
+                            "drafter": str(drafter_name).strip(),
+                            "overall_pick": normalized_pick.get("overall_pick"),
+                            "team": str(normalized_pick.get("team", "")).strip() or "The Field",
+                        }
+                    )
+                else:
+                    field_leagues.add(league_name)
+                continue
+
+            if not league_name:
+                continue
+
+            drafted_probability = _clamp_probability(normalized_pick.get("prob_at_pick", 0.0))
+            league_non_field_totals[league_name] = (
+                league_non_field_totals.get(league_name, 0.0) + drafted_probability
+            )
+
+    field_values_by_league = {}
+    for league_name in sorted(field_leagues):
+        drafted_total = league_non_field_totals.get(league_name, 0.0)
+        field_values_by_league[league_name] = _clamp_probability(100.0 - drafted_total)
+
+    return field_values_by_league, invalid_field_picks
+
+
+def resolve_field_picks_in_drafts(drafts):
+    field_values_by_league, invalid_field_picks = compute_field_values_by_league(drafts)
+    resolved_drafts = {}
+
+    for drafter_name, picks in (drafts or {}).items():
+        resolved_picks = []
+        normalized_picks = normalize_drafter_picks(picks, include_empty=True)
+
+        for normalized_pick in normalized_picks:
+            resolved_pick = dict(normalized_pick)
+            league_name = str(resolved_pick.get("league", "")).strip()
+
+            if resolved_pick.get("is_field"):
+                if league_name:
+                    resolved_field_value = field_values_by_league.get(league_name, 100.0)
+                else:
+                    resolved_field_value = 0.0
+
+                resolved_pick["field_value"] = _clamp_probability(resolved_field_value)
+                resolved_pick["resolved_probability"] = resolved_pick["field_value"]
+            else:
+                resolved_pick["resolved_probability"] = _clamp_probability(
+                    resolved_pick.get("prob_at_pick", 0.0)
+                )
+
+            resolved_picks.append(resolved_pick)
+
+        resolved_drafts[str(drafter_name).strip()] = resolved_picks
+
+    invalid_field_notes = []
+    for invalid_pick in invalid_field_picks:
+        drafter_name = invalid_pick.get("drafter", "")
+        overall_pick = invalid_pick.get("overall_pick")
+
+        if overall_pick is None:
+            invalid_field_notes.append(
+                f"{drafter_name}: The Field pick is missing a league and resolves to 0.0%."
+            )
+        else:
+            invalid_field_notes.append(
+                f"{drafter_name}: The Field pick #{overall_pick} is missing a league and resolves to 0.0%."
+            )
+
+    return resolved_drafts, field_values_by_league, invalid_field_notes
+
+
+def undo_last_pick_state():
+    pick_history = st.session_state.get("pick_history", [])
+    if not pick_history:
+        return False, "No picks available to undo."
+
+    last_entry = pick_history.pop()
+    last_drafter = str(last_entry.get("drafter", "")).strip()
+    last_pick = normalize_pick_entry(last_entry.get("pick", {}))
+
+    drafter_picks = st.session_state.get("drafts", {}).get(last_drafter, [])
+    if drafter_picks:
+        drafter_picks.pop()
+
+    if not last_pick.get("is_field"):
+        restored_team = str(last_pick.get("team", "")).strip()
+        restored_league = str(last_pick.get("league", "")).strip()
+        restored_prob = _clamp_probability(last_pick.get("prob_at_pick", 0.0))
+
+        if restored_team and restored_league:
+            restored_row = pd.DataFrame(
+                [{"team": restored_team, "league": restored_league, "prob": restored_prob}]
+            )
+
+            existing_pool = st.session_state.get("data", pd.DataFrame(columns=["team", "league", "prob"]))
+            duplicate_exists = False
+            if not existing_pool.empty and {"team", "league"}.issubset(existing_pool.columns):
+                duplicate_mask = (
+                    existing_pool["team"].astype(str).str.strip().eq(restored_team)
+                    & existing_pool["league"].astype(str).str.strip().eq(restored_league)
+                )
+                duplicate_exists = bool(duplicate_mask.any())
+
+            if not duplicate_exists:
+                restored_pool = pd.concat([existing_pool, restored_row], ignore_index=True)
+                st.session_state.data = restored_pool.sort_values(
+                    "prob", ascending=False, kind="mergesort"
+                ).reset_index(drop=True)
+
+    st.session_state.page = "draft"
+
+    players = st.session_state.get("players", [])
+    n_players = len(players)
+    if n_players > 0:
+        current_pick = int(st.session_state.get("pick", 0))
+        current_round = int(st.session_state.get("round", 1))
+
+        if current_pick == 0:
+            st.session_state.pick = n_players - 1
+            st.session_state.round = max(1, current_round - 1)
+        else:
+            st.session_state.pick = current_pick - 1
+
+        rounds_limit = int(st.session_state.get("rounds", st.session_state.round))
+        st.session_state.round = min(max(1, st.session_state.round), max(1, rounds_limit))
+
+    st.session_state.history_snapshot_saved = False
+
+    team_name = str(last_pick.get("team", "")).strip() or "(empty pick)"
+    league_name = str(last_pick.get("league", "")).strip()
+    if league_name:
+        message = f"Undid pick: {team_name} ({league_name})"
+    else:
+        message = f"Undid pick: {team_name}"
+
+    return True, message
+
+
 def create_results_csv(drafts):
     rows = []
 
@@ -120,7 +330,19 @@ def create_results_csv(drafts):
             rows.append({
                 "Drafter": player,
                 "Pick": pick,
-                "Team": team
+                "Team": team,
+                "League": normalized_pick.get("league", ""),
+                "Pick Type": normalized_pick.get("pick_type", "team"),
+                "Pick-Time Probability": _clamp_probability(normalized_pick.get("prob_at_pick", 0.0)),
+                "Field Value": _clamp_probability(normalized_pick.get("field_value", 0.0)) if normalized_pick.get("is_field") else 0.0,
+                "Resolved Probability": _clamp_probability(
+                    normalized_pick.get(
+                        "field_value",
+                        normalized_pick.get("resolved_probability", normalized_pick.get("prob_at_pick", 0.0)),
+                    ) if normalized_pick.get("is_field") else normalized_pick.get(
+                        "resolved_probability", normalized_pick.get("prob_at_pick", 0.0)
+                    )
+                ),
             })
 
     return pd.DataFrame(rows)
@@ -134,11 +356,18 @@ def format_pick_cell_label(normalized_pick, include_odds=False):
     if not include_odds:
         return team_name
 
-    probability = normalized_pick.get("prob_at_pick", 0.0)
-    try:
-        probability = float(probability)
-    except (TypeError, ValueError):
-        probability = 0.0
+    if normalized_pick.get("is_field"):
+        probability = normalized_pick.get(
+            "field_value",
+            normalized_pick.get("resolved_probability", normalized_pick.get("prob_at_pick", 0.0)),
+        )
+    else:
+        probability = normalized_pick.get(
+            "resolved_probability",
+            normalized_pick.get("prob_at_pick", 0.0),
+        )
+
+    probability = _clamp_probability(probability)
 
     return f"{team_name} ({probability:.1f}%)"
 
@@ -192,32 +421,81 @@ def build_round_grid_dataframe(drafts, drafter_order=None, include_odds=False, e
 
 
 def build_league_color_palette(league_names):
-    palette = {}
+    # Curated high-contrast colors keep league chips visibly distinct.
+    categorical_palette = [
+        "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#17becf",
+        "#bcbd22", "#e377c2", "#8c564b", "#7f7f7f", "#003f5c", "#ffa600",
+        "#7a5195", "#ef5675", "#2f4b7c", "#00a6a6", "#b2182b", "#4d9221",
+    ]
 
-    for league_name in sorted({str(name).strip() for name in league_names if str(name).strip()}):
+    palette = {}
+    used_indices = set()
+    palette_size = len(categorical_palette)
+    probe_step = 7
+
+    normalized_leagues = sorted({str(name).strip() for name in league_names if str(name).strip()})
+    for league_name in normalized_leagues:
         digest = hashlib.sha256(league_name.encode("utf-8")).hexdigest()
-        hue = (int(digest[:8], 16) % 360) / 360.0
-        red, green, blue = colorsys.hsv_to_rgb(hue, 0.22, 0.98)
-        palette[league_name] = "#{:02x}{:02x}{:02x}".format(
-            int(red * 255),
-            int(green * 255),
-            int(blue * 255),
-        )
+        base_index = int(digest[:8], 16) % palette_size
+
+        color_index = base_index
+        if len(used_indices) < palette_size:
+            attempts = 0
+            while color_index in used_indices and attempts < palette_size:
+                color_index = (color_index + probe_step) % palette_size
+                attempts += 1
+
+            used_indices.add(color_index)
+
+        palette[league_name] = categorical_palette[color_index]
 
     return palette
 
 
 def _text_color_for_background(hex_color):
-    hex_value = hex_color.strip().lstrip("#")
-    if len(hex_value) != 6:
+    def to_rgb(color_hex):
+        hex_value = str(color_hex).strip().lstrip("#")
+        if len(hex_value) != 6:
+            return None
+
+        try:
+            return (
+                int(hex_value[0:2], 16),
+                int(hex_value[2:4], 16),
+                int(hex_value[4:6], 16),
+            )
+        except ValueError:
+            return None
+
+    def relative_luminance(red, green, blue):
+        def linearize(channel):
+            srgb = channel / 255.0
+            if srgb <= 0.03928:
+                return srgb / 12.92
+            return ((srgb + 0.055) / 1.055) ** 2.4
+
+        r_lin = linearize(red)
+        g_lin = linearize(green)
+        b_lin = linearize(blue)
+        return 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin
+
+    bg_rgb = to_rgb(hex_color)
+    if bg_rgb is None:
         return "#1f2937"
 
-    red = int(hex_value[0:2], 16)
-    green = int(hex_value[2:4], 16)
-    blue = int(hex_value[4:6], 16)
-    luminance = (0.299 * red + 0.587 * green + 0.114 * blue) / 255
+    dark_text = "#111827"
+    light_text = "#f9fafb"
+    dark_rgb = to_rgb(dark_text)
+    light_rgb = to_rgb(light_text)
 
-    return "#111827" if luminance > 0.6 else "#f9fafb"
+    bg_luminance = relative_luminance(*bg_rgb)
+    dark_luminance = relative_luminance(*dark_rgb)
+    light_luminance = relative_luminance(*light_rgb)
+
+    dark_contrast = (max(bg_luminance, dark_luminance) + 0.05) / (min(bg_luminance, dark_luminance) + 0.05)
+    light_contrast = (max(bg_luminance, light_luminance) + 0.05) / (min(bg_luminance, light_luminance) + 0.05)
+
+    return dark_text if dark_contrast >= light_contrast else light_text
 
 
 def style_round_grid(grid_df, league_grid_df, league_palette, empty_marker="—"):
@@ -386,14 +664,20 @@ def build_winners_losers_standings(drafts, refreshed_probabilities):
             if not team_name:
                 continue
 
-            lookup_key = f"{league_name}::{team_name}" if league_name else ""
-            pick_probability = pick_probability_lookup.get(
-                lookup_key,
-                team_probability_lookup.get(team_name, 0.0),
-            )
+            if normalized_pick.get("is_field"):
+                pick_probability = normalized_pick.get(
+                    "field_value",
+                    normalized_pick.get("resolved_probability", normalized_pick.get("prob_at_pick", 0.0)),
+                )
+            else:
+                lookup_key = f"{league_name}::{team_name}" if league_name else ""
+                pick_probability = pick_probability_lookup.get(
+                    lookup_key,
+                    team_probability_lookup.get(team_name, 0.0),
+                )
 
             pick_probabilities.append(
-                float(pick_probability)
+                _clamp_probability(pick_probability)
             )
 
         picks_count = len(pick_probabilities)
@@ -460,9 +744,13 @@ def build_top_selections_by_drafter(drafts, top_n=3, drafter_order=None):
             continue
 
         picks_df = pd.DataFrame(normalized_picks)
-        picks_df["prob_at_pick"] = pd.to_numeric(
-            picks_df["prob_at_pick"], errors="coerce"
+        picks_df["prob_for_ranking"] = pd.to_numeric(
+            picks_df.get("resolved_probability", picks_df["prob_at_pick"]), errors="coerce"
         ).fillna(0.0)
+        field_mask = picks_df["is_field"].fillna(False)
+        picks_df.loc[field_mask, "prob_for_ranking"] = pd.to_numeric(
+            picks_df.loc[field_mask, "field_value"], errors="coerce"
+        ).fillna(picks_df.loc[field_mask, "prob_for_ranking"])
         picks_df["overall_pick"] = pd.to_numeric(
             picks_df["overall_pick"], errors="coerce"
         )
@@ -472,7 +760,7 @@ def build_top_selections_by_drafter(drafts, top_n=3, drafter_order=None):
         picks_df["league"] = picks_df["league"].fillna("").astype(str)
 
         top_picks = picks_df.sort_values(
-            ["prob_at_pick", "overall_pick_sort", "team", "league"],
+            ["prob_for_ranking", "overall_pick_sort", "team", "league"],
             ascending=[False, True, True, True],
             kind="mergesort",
         ).head(top_n_value)
@@ -485,7 +773,7 @@ def build_top_selections_by_drafter(drafts, top_n=3, drafter_order=None):
             else:
                 overall_pick_value = int(overall_pick_value)
 
-            prob_at_pick_value = float(getattr(pick_row, "prob_at_pick", 0.0))
+            prob_at_pick_value = _clamp_probability(getattr(pick_row, "prob_for_ranking", 0.0))
             team_name = str(getattr(pick_row, "team", "")).strip()
             league_name = str(getattr(pick_row, "league", "")).strip()
 
@@ -530,7 +818,14 @@ def build_league_ownership_analytics(drafts, drafter_order=None, tie_tolerance=1
                 {
                     "league": league_name,
                     "drafter": drafter_name,
-                    "prob_at_pick": float(normalized_pick.get("prob_at_pick", 0.0) or 0.0),
+                    "prob_at_pick": _clamp_probability(
+                        normalized_pick.get(
+                            "field_value",
+                            normalized_pick.get("resolved_probability", normalized_pick.get("prob_at_pick", 0.0)),
+                        ) if normalized_pick.get("is_field") else normalized_pick.get(
+                            "resolved_probability", normalized_pick.get("prob_at_pick", 0.0)
+                        )
+                    ),
                 }
             )
 
@@ -602,11 +897,36 @@ def persist_completed_draft_snapshot(drafts, standings, analytics=None):
     standings_rows = []
     for row in standings.itertuples(index=False):
         drafter_name = str(getattr(row, "drafter", "")).strip()
-        drafter_picks = [
-            pick["team"]
-            for pick in normalize_drafter_picks(drafts.get(drafter_name, []))
-            if pick["team"]
-        ]
+        normalized_drafter_picks = normalize_drafter_picks(drafts.get(drafter_name, []))
+        drafter_picks = [pick["team"] for pick in normalized_drafter_picks if pick["team"]]
+
+        drafter_pick_details = []
+        for pick in normalized_drafter_picks:
+            if not pick["team"]:
+                continue
+
+            drafter_pick_details.append(
+                {
+                    "team": pick.get("team", ""),
+                    "league": pick.get("league", ""),
+                    "pick_type": pick.get("pick_type", "team"),
+                    "is_field": bool(pick.get("is_field", False)),
+                    "field_scope": pick.get("field_scope", ""),
+                    "field_value": _clamp_probability(pick.get("field_value", 0.0)),
+                    "prob_at_pick": _clamp_probability(pick.get("prob_at_pick", 0.0)),
+                    "resolved_probability": _clamp_probability(
+                        pick.get(
+                            "field_value",
+                            pick.get("resolved_probability", pick.get("prob_at_pick", 0.0)),
+                        ) if pick.get("is_field") else pick.get(
+                            "resolved_probability", pick.get("prob_at_pick", 0.0)
+                        )
+                    ),
+                    "round": pick.get("round"),
+                    "pick_in_round": pick.get("pick_in_round"),
+                    "overall_pick": pick.get("overall_pick"),
+                }
+            )
 
         standings_rows.append(
             {
@@ -616,6 +936,7 @@ def persist_completed_draft_snapshot(drafts, standings, analytics=None):
                 "average_odds": float(getattr(row, "average_pick_probability", 0.0)),
                 "picks_count": int(getattr(row, "picks_count", 0)),
                 "picks_list": drafter_picks,
+                "picks": drafter_pick_details,
             }
         )
 
@@ -843,6 +1164,9 @@ if st.session_state.page == "setup":
             for p in players
         }
 
+        st.session_state.pick_history = []
+        st.session_state.undo_message = ""
+
         st.session_state.round = 1
         st.session_state.pick = 0
 
@@ -891,6 +1215,35 @@ elif st.session_state.page == "draft":
         + st.session_state.pick
         + 1
     )
+
+    undo_message = str(st.session_state.pop("undo_message", "")).strip()
+    if undo_message:
+        st.info(undo_message)
+
+    def commit_pick(structured_pick, pool_index=None):
+        st.session_state.drafts[current_player].append(structured_pick)
+
+        pick_history = st.session_state.setdefault("pick_history", [])
+        pick_history.append(
+            {
+                "drafter": current_player,
+                "pick": dict(structured_pick),
+            }
+        )
+
+        if pool_index is not None:
+            st.session_state.data = st.session_state.data.drop(pool_index)
+
+        st.session_state.pick += 1
+
+        if st.session_state.pick >= n_players:
+            st.session_state.pick = 0
+            st.session_state.round += 1
+
+        if st.session_state.round > st.session_state.rounds:
+            st.session_state.page = "finished"
+
+        st.rerun()
 
 
     st.title("🏟 Draft Room")
@@ -1042,41 +1395,7 @@ elif st.session_state.page == "draft":
                     }
                 )
 
-                st.session_state.drafts[
-                    current_player
-                ].append(
-                    structured_pick
-                )
-
-
-                st.session_state.data = (
-                    st.session_state.data
-                    .drop(idx)
-                )
-
-
-                st.session_state.pick += 1
-
-
-                if (
-                    st.session_state.pick
-                    >= n_players
-                ):
-
-                    st.session_state.pick = 0
-                    st.session_state.round += 1
-
-
-
-                if (
-                    st.session_state.round
-                    > st.session_state.rounds
-                ):
-
-                    st.session_state.page = "finished"
-
-
-                st.rerun()
+                commit_pick(structured_pick, pool_index=idx)
 
 
 
@@ -1085,6 +1404,68 @@ elif st.session_state.page == "draft":
     # ==========================
 
     with right:
+
+        if st.button(
+            "↩ Undo Last Pick",
+            key="undo_last_pick_draft",
+            disabled=not st.session_state.get("pick_history", []),
+        ):
+            was_undone, undo_feedback = undo_last_pick_state()
+            st.session_state.undo_message = undo_feedback
+            if was_undone:
+                st.rerun()
+
+        st.divider()
+
+        st.header("🎯 The Field")
+
+        field_league_options = list(st.session_state.get("selected_leagues", []))
+        drafted_field_leagues = get_drafted_field_leagues(st.session_state.get("drafts", {}))
+        available_field_leagues = [
+            league_name for league_name in field_league_options
+            if league_name not in drafted_field_leagues
+        ]
+
+        field_league = st.selectbox(
+            "Field league",
+            options=field_league_options,
+            key="field_league_select",
+            disabled=not field_league_options,
+        )
+
+        field_locked = bool(field_league) and field_league in drafted_field_leagues
+        if field_locked:
+            st.caption(f"The Field was already drafted for {field_league}.")
+        elif field_league and field_league in available_field_leagues:
+            st.caption(f"Draft The Field for {field_league}.")
+
+        if st.button(
+            "Draft The Field",
+            key="draft_the_field_button",
+            disabled=(not field_league_options) or field_locked,
+        ):
+            drafted_field_leagues = get_drafted_field_leagues(st.session_state.get("drafts", {}))
+            if field_league in drafted_field_leagues:
+                st.warning(f"The Field for {field_league} has already been drafted.")
+            else:
+                field_pick = normalize_pick_entry(
+                    {
+                        "team": "The Field",
+                        "league": field_league,
+                        "pick_type": "field",
+                        "is_field": True,
+                        "field_scope": "league",
+                        "field_value": 0.0,
+                        "prob_at_pick": 0.0,
+                        "round": st.session_state.round,
+                        "pick_in_round": st.session_state.pick + 1,
+                        "overall_pick": pick_number,
+                    }
+                )
+
+                commit_pick(field_pick)
+
+        st.divider()
 
         st.header("📋 Draft Board")
 
@@ -1135,14 +1516,28 @@ elif st.session_state.page == "finished":
         "Final Draft Results (Round Grid)"
     )
 
+    if st.button(
+        "↩ Undo Last Pick",
+        key="undo_last_pick_finished",
+        disabled=not st.session_state.get("pick_history", []),
+    ):
+        was_undone, undo_feedback = undo_last_pick_state()
+        st.session_state.undo_message = undo_feedback
+        if was_undone:
+            st.rerun()
+
     show_odds_in_grid = st.toggle(
         "Show odds in round grid labels",
         value=False,
         key="show_odds_in_round_grid",
     )
 
+    resolved_drafts, field_values_by_league, invalid_field_notes = resolve_field_picks_in_drafts(
+        st.session_state.drafts
+    )
+
     round_grid_results, round_grid_leagues = build_round_grid_dataframe(
-        st.session_state.drafts,
+        resolved_drafts,
         drafter_order=st.session_state.get("players", []),
         include_odds=show_odds_in_grid,
     )
@@ -1183,7 +1578,7 @@ elif st.session_state.page == "finished":
 
 
     results = create_results_csv(
-        st.session_state.drafts
+        resolved_drafts
     )
 
 
@@ -1235,21 +1630,26 @@ elif st.session_state.page == "finished":
         selected_leagues
     )
     standings = build_winners_losers_standings(
-        st.session_state.drafts,
+        resolved_drafts,
         refreshed_probabilities
     )
 
     top_picks_df, top_picks_snapshot = build_top_selections_by_drafter(
-        st.session_state.drafts,
+        resolved_drafts,
         top_n=3,
         drafter_order=st.session_state.get("players", []),
     )
     ownership_matrix_df, ownership_summary_df, ownership_snapshot = build_league_ownership_analytics(
-        st.session_state.drafts,
+        resolved_drafts,
         drafter_order=st.session_state.get("players", []),
     )
     analytics_snapshot = {
         "top_n": 3,
+        "field_values_by_league": {
+            league_name: round(_clamp_probability(field_value), 6)
+            for league_name, field_value in field_values_by_league.items()
+        },
+        "invalid_field_notes": invalid_field_notes,
         "top_selections": top_picks_snapshot,
         "league_ownership": ownership_snapshot,
     }
@@ -1258,7 +1658,7 @@ elif st.session_state.page == "finished":
     if not standings.empty and not st.session_state.get("history_snapshot_saved", False):
         try:
             was_saved = persist_completed_draft_snapshot(
-                st.session_state.drafts,
+                resolved_drafts,
                 standings,
                 analytics=analytics_snapshot,
             )
@@ -1308,8 +1708,12 @@ elif st.session_state.page == "finished":
         "Top Selections by Drafter"
     )
     st.caption(
-        "Top picks are ranked by pick-time probability captured when each selection was drafted."
+        "Top picks are ranked by selection probability, where The Field uses resolved post-draft value."
     )
+
+    if invalid_field_notes:
+        for invalid_note in invalid_field_notes:
+            st.warning(invalid_note)
 
     if top_picks_df.empty:
         st.info(
